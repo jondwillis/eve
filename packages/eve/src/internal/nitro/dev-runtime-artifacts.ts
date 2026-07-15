@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { cp, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync, type Dirent } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
 import type { CompileAgentResult } from "#compiler/compile-agent.js";
 import { copyDevelopmentSourceSnapshot } from "#internal/nitro/dev-runtime-source-snapshot-copy.js";
 import { createDevelopmentSourceSnapshotPlan } from "#internal/nitro/dev-runtime-source-snapshot.js";
+import { renameWithTransientBusyRetry } from "#shared/rename-with-retry.js";
 
 const DEV_RUNTIME_ARTIFACTS_DIRECTORY = "dev-runtime";
 const DEV_RUNTIME_ARTIFACTS_ACTIVATED_MARKER = "activated";
@@ -38,6 +39,16 @@ export interface DevelopmentRuntimeArtifactsSnapshot {
   readonly snapshotRoot: string;
   readonly snapshotSourceRoot: string;
   readonly sourceRoot: string;
+}
+
+export interface ActiveDevelopmentRuntimeArtifactsSnapshot {
+  readonly runtimeAppRoot: string;
+  readonly snapshotRoot: string;
+}
+
+export interface DevelopmentRuntimeArtifactsActivation {
+  commit(): void;
+  rollback(): Promise<void>;
 }
 
 /**
@@ -115,8 +126,50 @@ export async function activateDevelopmentRuntimeArtifactsSnapshot(input: {
   readonly appRoot: string;
   readonly snapshot: DevelopmentRuntimeArtifactsSnapshot;
 }): Promise<void> {
-  await writeFile(join(input.snapshot.snapshotRoot, DEV_RUNTIME_ARTIFACTS_ACTIVATED_MARKER), "");
-  await writeDevelopmentRuntimeArtifactsPointer(input);
+  const activation = await activateDevelopmentRuntimeArtifactsSnapshotTransaction(input);
+  activation.commit();
+}
+
+export async function activateDevelopmentRuntimeArtifactsSnapshotTransaction(input: {
+  readonly appRoot: string;
+  readonly snapshot: DevelopmentRuntimeArtifactsSnapshot;
+}): Promise<DevelopmentRuntimeArtifactsActivation> {
+  const markerPath = join(input.snapshot.snapshotRoot, DEV_RUNTIME_ARTIFACTS_ACTIVATED_MARKER);
+  const pointerPath = resolveDevelopmentRuntimeArtifactsPointerPath(input.appRoot);
+  const previousPointerSource = await readOptionalFile(pointerPath);
+
+  try {
+    await writeFile(markerPath, "");
+    await writeDevelopmentRuntimeArtifactsPointer(input);
+  } catch (error) {
+    throw await rollbackFailedActivation({
+      cause: error,
+      markerPath,
+      pointerPath,
+      previousPointerSource,
+    });
+  }
+
+  let settled = false;
+  return {
+    commit() {
+      settled = true;
+    },
+    async rollback() {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      const rollbackError = await restoreDevelopmentRuntimeArtifactsActivation({
+        markerPath,
+        pointerPath,
+        previousPointerSource,
+      });
+      if (rollbackError !== undefined) {
+        throw rollbackError;
+      }
+    },
+  };
 }
 
 /**
@@ -136,6 +189,21 @@ export function readDevelopmentRuntimeArtifactsSnapshotRoot(
   }
 
   return pointer.runtimeAppRoot;
+}
+
+export function readActiveDevelopmentRuntimeArtifactsSnapshot(
+  appRoot: string,
+): ActiveDevelopmentRuntimeArtifactsSnapshot | undefined {
+  const pointer = readDevelopmentRuntimeArtifactsPointer(
+    resolveDevelopmentRuntimeArtifactsPointerPath(appRoot),
+  );
+  if (pointer === undefined || pointer.version === 1) {
+    return undefined;
+  }
+  return {
+    runtimeAppRoot: pointer.runtimeAppRoot,
+    snapshotRoot: pointer.snapshotRoot,
+  };
 }
 
 /**
@@ -468,7 +536,6 @@ async function writeDevelopmentRuntimeArtifactsPointer(input: {
   readonly snapshot: DevelopmentRuntimeArtifactsSnapshot;
 }): Promise<void> {
   const pointerPath = resolveDevelopmentRuntimeArtifactsPointerPath(input.appRoot);
-  const temporaryPointerPath = `${pointerPath}.${randomUUID()}.tmp`;
   const pointer: DevelopmentRuntimeArtifactsPointerV2 = {
     appRoot: input.appRoot,
     kind: "eve-dev-runtime-artifacts-pointer",
@@ -477,14 +544,76 @@ async function writeDevelopmentRuntimeArtifactsPointer(input: {
     version: DEV_RUNTIME_ARTIFACTS_POINTER_VERSION,
   };
 
+  await writeDevelopmentRuntimeArtifactsPointerSource(
+    pointerPath,
+    `${JSON.stringify(pointer, null, 2)}\n`,
+  );
+}
+
+async function writeDevelopmentRuntimeArtifactsPointerSource(
+  pointerPath: string,
+  source: string,
+): Promise<void> {
+  const temporaryPointerPath = `${pointerPath}.${randomUUID()}.tmp`;
   await mkdir(dirname(pointerPath), { recursive: true });
-  await writeFile(temporaryPointerPath, `${JSON.stringify(pointer, null, 2)}\n`);
+  await writeFile(temporaryPointerPath, source);
   try {
-    await rename(temporaryPointerPath, pointerPath);
+    await renameWithTransientBusyRetry(temporaryPointerPath, pointerPath);
   } catch (error) {
     await rm(temporaryPointerPath, { force: true }).catch(() => {});
     throw error;
   }
+}
+
+async function readOptionalFile(path: string): Promise<string | undefined> {
+  try {
+    return await readFile(path, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function rollbackFailedActivation(input: {
+  readonly cause: unknown;
+  readonly markerPath: string;
+  readonly pointerPath: string;
+  readonly previousPointerSource: string | undefined;
+}): Promise<unknown> {
+  const rollbackError = await restoreDevelopmentRuntimeArtifactsActivation(input);
+  if (rollbackError === undefined) {
+    return input.cause;
+  }
+  return new AggregateError(
+    [input.cause, rollbackError],
+    "Development runtime activation and rollback failed.",
+    { cause: input.cause },
+  );
+}
+
+async function restoreDevelopmentRuntimeArtifactsActivation(input: {
+  readonly markerPath: string;
+  readonly pointerPath: string;
+  readonly previousPointerSource: string | undefined;
+}): Promise<AggregateError | undefined> {
+  const restoration = await Promise.allSettled([
+    input.previousPointerSource === undefined
+      ? rm(input.pointerPath, { force: true })
+      : writeDevelopmentRuntimeArtifactsPointerSource(
+          input.pointerPath,
+          input.previousPointerSource,
+        ),
+    rm(input.markerPath, { force: true }),
+  ]);
+  const errors = restoration.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+  if (errors.length === 0) {
+    return undefined;
+  }
+  return new AggregateError(errors, "Failed to restore development runtime activation.");
 }
 
 async function validateSnapshotCompiledManifestRoots(input: {
