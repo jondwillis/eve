@@ -51,11 +51,17 @@ export async function startEveDev(
     stderr += chunk;
   });
 
-  const url = await waitForServerUrl({
-    child,
-    getOutput: () => ({ stderr, stdout }),
-  });
-  await waitForPath(join(appRoot, ".eve", "dev-server-state.v1.json"));
+  let url: string;
+  try {
+    url = await waitForServerUrl({
+      child,
+      getOutput: () => ({ stderr, stdout }),
+    });
+    await waitForPath(join(appRoot, ".eve", "dev-server-state.v1.json"));
+  } catch (error) {
+    await stopEveDevChild(child);
+    throw error;
+  }
 
   return {
     async crash() {
@@ -73,25 +79,38 @@ export async function startEveDev(
     stderr: () => stderr,
     stdout: () => stdout,
     async stop() {
-      if (child.exitCode !== null || child.signalCode !== null) {
-        return;
-      }
-
-      await new Promise<void>((resolve) => {
-        const timeout = setTimeout(() => {
-          child.kill("SIGKILL");
-          resolve();
-        }, 10_000);
-
-        child.once("exit", () => {
-          clearTimeout(timeout);
-          resolve();
-        });
-        child.kill("SIGTERM");
-      });
+      await stopEveDevChild(child);
     },
     url,
   };
+}
+
+async function stopEveDevChild(
+  child: ChildProcessByStdio<null, Readable, Readable>,
+): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const forceTimeout = setTimeout(() => child.kill("SIGKILL"), 10_000);
+    const finalTimeout = setTimeout(settle, 15_000);
+
+    function settle() {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(forceTimeout);
+      clearTimeout(finalTimeout);
+      child.off("exit", settle);
+      resolve();
+    }
+
+    child.once("exit", settle);
+    child.kill("SIGTERM");
+  });
 }
 
 /**
@@ -175,6 +194,9 @@ export function hasKnownDevServerFailure(text: string): boolean {
     text.includes("UNRESOLVED_IMPORT") ||
     text.includes("ECONNRESET") ||
     text.includes("socket hang up") ||
+    text.includes("UnhandledPromiseRejection") ||
+    text.includes("ERR_UNHANDLED_REJECTION") ||
+    text.includes("dev worker restart failed") ||
     (text.includes("ERR_MODULE_NOT_FOUND") && text.includes("authored-module-map-loader"))
   );
 }
