@@ -2,4 +2,4 @@
 "eve": patch
 ---
 
-Reload development env files after every `/model` flow exit — completed or cancelled — so credentials written while the flow is open (e.g. a hand-pasted `AI_GATEWAY_API_KEY` in `.env.local`) take effect without restarting the session.
+Refresh the dev TUI's model-access view after every `/model` flow exit — completed or cancelled. Cancelling `/model` after writing an `AI_GATEWAY_API_KEY` into `.env.local` no longer leaves a stale "model provider not linked" attention line; the runner reloads env and re-reads agent info on the way out.
