@@ -115,6 +115,7 @@ describe("runTuiSetupCommand", () => {
     await expect(run({ command: "model", flows })).resolves.toEqual({
       message: "Model changed to openai/gpt-5.5. Live on your next prompt.",
       preserveFlowDiagnostics: false,
+      effect: { kind: "model-access-changed" },
     });
     expect(flows.runModelFlow).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -188,13 +189,14 @@ describe("runTuiSetupCommand", () => {
     });
   });
 
-  it("reports a cancelled model pick", async () => {
+  it("reports a cancelled model pick and still refreshes model access", async () => {
     const flows = fakeFlows({
       runModelFlow: vi.fn<TuiSetupFlows["runModelFlow"]>(async () => ({ kind: "cancelled" })),
     });
     await expect(run({ command: "model", flows })).resolves.toEqual({
       message: "/model cancelled.",
       preserveFlowDiagnostics: false,
+      effect: { kind: "model-access-changed" },
     });
   });
 

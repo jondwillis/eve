@@ -192,8 +192,17 @@ async function executeSetupCommand(
           modelInput.initialStep = input.initialModelStep;
         }
         const result = await flows.runModelFlow(modelInput);
+        // Every exit from /model — done or cancelled — refreshes model
+        // access. The flow surfaces the env-file instructions, so the user
+        // may have hand-edited .env.local (e.g. pasted a fresh
+        // AI_GATEWAY_API_KEY) and backed out; the runner must reload the
+        // development env files either way. /connect behaves the same.
         if (result.kind === "cancelled") {
-          return { message: "/model cancelled.", preserveFlowDiagnostics: false };
+          return {
+            message: "/model cancelled.",
+            preserveFlowDiagnostics: false,
+            effect: { kind: "model-access-changed" },
+          };
         }
         // One line per completed menu action: the apply line (it already
         // distinguishes success from a rejected slug), then the provider
@@ -203,16 +212,11 @@ async function executeSetupCommand(
         if (result.providerOutcome !== undefined) {
           lines.push(providerOutcomeMessage(result.providerOutcome));
         }
-        const outcome: TuiSetupCommandResult = {
+        return {
           message: lines.join("\n"),
           preserveFlowDiagnostics: false,
+          effect: { kind: "model-access-changed" },
         };
-        // Provider setup can change both the local env and Vercel identity.
-        // The runner refreshes the complete model-access view after the flow.
-        if (result.providerOutcome !== undefined) {
-          outcome.effect = { kind: "model-access-changed" };
-        }
-        return outcome;
       }
       case "channels": {
         const result = await flows.runChannelsFlow({ appRoot, prompter, signal });
