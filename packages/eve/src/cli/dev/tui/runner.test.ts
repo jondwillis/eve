@@ -2096,6 +2096,7 @@ describe("EveTUIRunner boot setup detection", () => {
     refreshInfo: () => Promise<AgentInfoResult>;
     renderer?: Partial<AgentTUIRenderer>;
     bootDetections?: BootDetection[];
+    handlerOutcome?: PromptCommandOutcome;
   }) {
     const client = stubClient();
     vi.spyOn(client, "info")
@@ -2129,10 +2130,11 @@ describe("EveTUIRunner boot setup detection", () => {
       detectProjectIdentity: vi.fn(async () => undefined),
       getVercelAuthStatus: vi.fn(async (): Promise<"authenticated"> => "authenticated"),
       promptCommandHandler: {
-        handle: async () => ({
-          message: "Connected to AI Gateway via AI_GATEWAY_API_KEY in .env.local.",
-          effect: { kind: "model-access-changed" },
-        }),
+        handle: async () =>
+          input.handlerOutcome ?? {
+            message: "Connected to AI Gateway via AI_GATEWAY_API_KEY in .env.local.",
+            effect: { kind: "model-access-changed" },
+          },
       },
     });
 
@@ -2332,6 +2334,39 @@ describe("EveTUIRunner boot setup detection", () => {
       { kind: "gateway", connected: false },
       { kind: "gateway", connected: true, credential: "api-key" },
     ]);
+  });
+
+  // Regression for the /model cancel path: the flow surfaces env-file
+  // instructions, so a user can write AI_GATEWAY_API_KEY into .env.local and
+  // then back out of the menu. The cancel outcome must still refresh model
+  // access, or the disconnected snapshot lingers until the next command.
+  it("refreshes model access when /model is cancelled after credentials land", async () => {
+    const { client, runner } = providerSetupRefreshRunner({
+      refreshInfo: async () => disconnectedGatewayInfo,
+      handlerOutcome: {
+        message: "/model cancelled.",
+        effect: { kind: "model-access-changed" },
+      },
+    });
+
+    await runner.run();
+
+    // The second info read is the post-cancel refresh driven by the
+    // model-access-changed effect; without it the runner never re-reads.
+    await vi.waitFor(() => expect(client.info).toHaveBeenCalledTimes(2));
+  });
+
+  it("skips the model-access refresh when a cancelled /model carries no effect", async () => {
+    const { client, runner } = providerSetupRefreshRunner({
+      refreshInfo: async () => disconnectedGatewayInfo,
+      handlerOutcome: { message: "/model cancelled." },
+    });
+
+    await runner.run();
+
+    // Pre-fix behavior: a cancelled /model with no effect never reloads env
+    // or re-reads info, so the boot-time snapshot is all the runner has.
+    expect(client.info).toHaveBeenCalledTimes(1);
   });
 
   it("drops stale disconnected evidence when the post-setup info refresh fails", async () => {
